@@ -109,17 +109,14 @@ let facingMode = 'user';
 let stream = null;
 let animId = null;
 
-// Offscreen canvas for motion detection
 const motionCanvas = document.createElement('canvas');
 const motionCtx = motionCanvas.getContext('2d', { willReadFrequently: true });
 let prevFrame = null;
 
-// Particles
 const PARTICLE_COUNT = 120;
 const MAX_DIST = 130;
 let particles = [];
 
-// Modes: 0=particles overlay, 1=edge glow, 2=motion burst
 let mode = 0;
 const modeNames = ['Particules', 'Contours', 'Motion'];
 
@@ -140,7 +137,7 @@ function initParticles() {
       vx: (Math.random() - 0.5) * 1.2,
       vy: (Math.random() - 0.5) * 1.2,
       r: Math.random() * 2.5 + 1,
-      hue: Math.random() * 60 + 30, // golden tones
+      hue: Math.random() * 60 + 30,
       life: Math.random(),
     });
   }
@@ -166,7 +163,6 @@ async function startCamera() {
   }
 }
 
-// Motion detection: returns hot zones as array of {x,y,intensity}
 function getMotionZones() {
   const mw = motionCanvas.width;
   const mh = motionCanvas.height;
@@ -177,7 +173,7 @@ function getMotionZones() {
 
   const cd = curr.data;
   const pd = prevFrame.data;
-  const step = 4 * 4; // sample every 4 pixels
+  const step = 4 * 4;
   for (let i = 0; i < cd.length; i += step) {
     const diff = Math.abs(cd[i] - pd[i]) + Math.abs(cd[i+1] - pd[i+1]) + Math.abs(cd[i+2] - pd[i+2]);
     if (diff > 40) {
@@ -200,7 +196,6 @@ function loop() {
 
   const motionZones = getMotionZones();
 
-  // Draw video frame (mirrored for front cam)
   ctx.save();
   if (facingMode === 'user') {
     ctx.translate(W, 0);
@@ -215,11 +210,9 @@ function loop() {
 }
 
 function drawParticles(motionZones) {
-  // Darken overlay slightly
   ctx.fillStyle = 'rgba(0,0,0,0.18)';
   ctx.fillRect(0, 0, W, H);
 
-  // Push particles toward motion zones
   for (const p of particles) {
     for (const z of motionZones) {
       const dx = z.x - p.x;
@@ -230,21 +223,16 @@ function drawParticles(motionZones) {
         p.vy += (dy / dist) * z.intensity * 0.4;
       }
     }
-
-    // Damping
     p.vx *= 0.97;
     p.vy *= 0.97;
     p.x += p.vx;
     p.y += p.vy;
-
-    // Bounce
     if (p.x < 0 || p.x > W) p.vx *= -1;
     if (p.y < 0 || p.y > H) p.vy *= -1;
     p.x = Math.max(0, Math.min(W, p.x));
     p.y = Math.max(0, Math.min(H, p.y));
   }
 
-  // Draw connections
   for (let i = 0; i < particles.length; i++) {
     for (let j = i + 1; j < particles.length; j++) {
       const a = particles[i], b = particles[j];
@@ -262,7 +250,6 @@ function drawParticles(motionZones) {
     }
   }
 
-  // Draw dots
   for (const p of particles) {
     ctx.beginPath();
     ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
@@ -275,7 +262,6 @@ function drawParticles(motionZones) {
 }
 
 function drawEdgeGlow() {
-  // Simple luminance edge detection via composite
   ctx.save();
   ctx.globalCompositeOperation = 'difference';
   ctx.filter = 'blur(2px)';
@@ -286,8 +272,6 @@ function drawEdgeGlow() {
   ctx.drawImage(video, 0, 0, W, H);
   ctx.restore();
   ctx.filter = 'none';
-
-  // Golden tint overlay
   ctx.globalCompositeOperation = 'screen';
   ctx.fillStyle = 'rgba(255,180,30,0.15)';
   ctx.fillRect(0, 0, W, H);
@@ -310,7 +294,6 @@ function drawMotionBurst(motionZones) {
     ctx.fill();
   }
 
-  // Still draw particles lightly
   for (const p of particles) {
     p.x += p.vx; p.y += p.vy;
     if (p.x < 0 || p.x > W) p.vx *= -1;
@@ -322,7 +305,6 @@ function drawMotionBurst(motionZones) {
   }
 }
 
-// Events
 document.getElementById('start-btn').addEventListener('click', () => {
   document.getElementById('start-screen').style.display = 'none';
   startCamera();
