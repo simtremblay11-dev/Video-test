@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <title>Particle Vision</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #000; overflow: hidden; width: 100vw; height: 100vh; }
@@ -33,11 +34,7 @@
     }
     button:active { background: rgba(255,255,255,0.3); }
 
-    #canvas {
-      display: block;
-      width: 100vw;
-      height: 100vh;
-    }
+    #canvas { display: block; width: 100vw; height: 100vh; }
 
     #start-screen {
       position: fixed;
@@ -73,11 +70,21 @@
       border-color: rgba(255,200,80,0.6);
       color: #ffc850;
     }
-
     #mode-label {
       color: rgba(255,255,255,0.6);
       font-family: -apple-system, sans-serif;
       font-size: 13px;
+    }
+    #loading {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: rgba(255,200,80,0.7);
+      font-family: -apple-system, sans-serif;
+      font-size: 13px;
+      z-index: 10;
+      display: none;
     }
   </style>
 </head>
@@ -85,7 +92,7 @@
 
 <div id="start-screen">
   <h1>PARTICLE VISION</h1>
-  <p>Effet de réseau de particules interactif sur ta caméra en direct</p>
+  <p>Montre tes deux mains à la caméra pour connecter tes doigts</p>
   <button id="start-btn">Activer la caméra</button>
 </div>
 
@@ -97,19 +104,22 @@
   <button id="mode-btn">Changer</button>
 </div>
 
+<div id="loading">Chargement détection mains...</div>
+
 <video id="video" autoplay playsinline muted style="display:none"></video>
 
 <script>
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const video = document.getElementById('video');
+const loadingEl = document.getElementById('loading');
 
 let W, H;
 let facingMode = 'user';
 let stream = null;
 let animId = null;
 
-// Offscreen canvas for motion detection
+// Motion detection
 const motionCanvas = document.createElement('canvas');
 const motionCtx = motionCanvas.getContext('2d', { willReadFrequently: true });
 let prevFrame = null;
@@ -119,10 +129,47 @@ const PARTICLE_COUNT = 120;
 const MAX_DIST = 130;
 let particles = [];
 
-// Modes: 0=particles overlay, 1=edge glow, 2=motion burst
 let mode = 0;
 const modeNames = ['Particules', 'Contours', 'Motion'];
 
+// Finger tip landmark indices (MediaPipe Hands)
+const FINGERTIPS = [4, 8, 12, 16, 20];
+
+// Stored hand results from MediaPipe
+let handData = { left: null, right: null };
+let handsReady = false;
+let lastHandSend = 0;
+
+// ── MediaPipe setup ──────────────────────────────────────────────
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+});
+
+hands.setOptions({
+  maxNumHands: 2,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.5,
+});
+
+hands.onResults((results) => {
+  handData = { left: null, right: null };
+  if (!results.multiHandLandmarks) return;
+  results.multiHandLandmarks.forEach((landmarks, i) => {
+    // MediaPipe labels from the model's perspective (mirrored for selfie cam)
+    const label = results.multiHandedness[i].label; // 'Left' or 'Right'
+    handData[label.toLowerCase()] = landmarks;
+  });
+});
+
+async function initHands() {
+  loadingEl.style.display = 'block';
+  await hands.initialize();
+  handsReady = true;
+  loadingEl.style.display = 'none';
+}
+
+// ── Canvas / particle helpers ────────────────────────────────────
 function resize() {
   W = canvas.width = window.innerWidth;
   H = canvas.height = window.innerHeight;
@@ -140,16 +187,21 @@ function initParticles() {
       vx: (Math.random() - 0.5) * 1.2,
       vy: (Math.random() - 0.5) * 1.2,
       r: Math.random() * 2.5 + 1,
-      hue: Math.random() * 60 + 30, // golden tones
-      life: Math.random(),
+      hue: Math.random() * 60 + 30,
     });
   }
 }
 
+// Convert normalized landmark to canvas coords, accounting for mirror
+function lmToCanvas(lm) {
+  const x = facingMode === 'user' ? (1 - lm.x) * W : lm.x * W;
+  const y = lm.y * H;
+  return { x, y };
+}
+
+// ── Camera ───────────────────────────────────────────────────────
 async function startCamera() {
-  if (stream) {
-    stream.getTracks().forEach(t => t.stop());
-  }
+  if (stream) stream.getTracks().forEach(t => t.stop());
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -166,46 +218,42 @@ async function startCamera() {
   }
 }
 
-// Motion detection: returns hot zones as array of {x,y,intensity}
+// ── Motion detection ─────────────────────────────────────────────
 function getMotionZones() {
-  const mw = motionCanvas.width;
-  const mh = motionCanvas.height;
+  const mw = motionCanvas.width, mh = motionCanvas.height;
   motionCtx.drawImage(video, 0, 0, mw, mh);
   const curr = motionCtx.getImageData(0, 0, mw, mh);
   const zones = [];
   if (!prevFrame) { prevFrame = curr; return zones; }
-
-  const cd = curr.data;
-  const pd = prevFrame.data;
-  const step = 4 * 4; // sample every 4 pixels
-  for (let i = 0; i < cd.length; i += step) {
-    const diff = Math.abs(cd[i] - pd[i]) + Math.abs(cd[i+1] - pd[i+1]) + Math.abs(cd[i+2] - pd[i+2]);
+  const cd = curr.data, pd = prevFrame.data;
+  for (let i = 0; i < cd.length; i += 16) {
+    const diff = Math.abs(cd[i]-pd[i]) + Math.abs(cd[i+1]-pd[i+1]) + Math.abs(cd[i+2]-pd[i+2]);
     if (diff > 40) {
-      const px = (i / 4) % mw;
-      const py = Math.floor((i / 4) / mw);
-      zones.push({
-        x: (px / mw) * W,
-        y: (py / mh) * H,
-        intensity: Math.min(diff / 255, 1),
-      });
+      const px = (i/4) % mw, py = Math.floor((i/4) / mw);
+      zones.push({ x: (px/mw)*W, y: (py/mh)*H, intensity: Math.min(diff/255, 1) });
     }
   }
   prevFrame = curr;
   return zones;
 }
 
+// ── Main loop ────────────────────────────────────────────────────
 function loop() {
   animId = requestAnimationFrame(loop);
   if (video.readyState < 2) return;
 
+  // Feed MediaPipe every ~33ms
+  const now = performance.now();
+  if (handsReady && now - lastHandSend > 33) {
+    hands.send({ image: video });
+    lastHandSend = now;
+  }
+
   const motionZones = getMotionZones();
 
-  // Draw video frame (mirrored for front cam)
+  // Draw video (mirrored for front cam)
   ctx.save();
-  if (facingMode === 'user') {
-    ctx.translate(W, 0);
-    ctx.scale(-1, 1);
-  }
+  if (facingMode === 'user') { ctx.translate(W, 0); ctx.scale(-1, 1); }
   ctx.drawImage(video, 0, 0, W, H);
   ctx.restore();
 
@@ -214,80 +262,120 @@ function loop() {
   else if (mode === 2) drawMotionBurst(motionZones);
 }
 
+// ── Draw modes ───────────────────────────────────────────────────
 function drawParticles(motionZones) {
-  // Darken overlay slightly
   ctx.fillStyle = 'rgba(0,0,0,0.18)';
   ctx.fillRect(0, 0, W, H);
 
-  // Push particles toward motion zones
+  // Move particles toward motion
   for (const p of particles) {
     for (const z of motionZones) {
-      const dx = z.x - p.x;
-      const dy = z.y - p.y;
+      const dx = z.x - p.x, dy = z.y - p.y;
       const dist = Math.sqrt(dx*dx + dy*dy);
-      if (dist < 200) {
-        p.vx += (dx / dist) * z.intensity * 0.4;
-        p.vy += (dy / dist) * z.intensity * 0.4;
-      }
+      if (dist < 200) { p.vx += (dx/dist)*z.intensity*0.4; p.vy += (dy/dist)*z.intensity*0.4; }
     }
-
-    // Damping
-    p.vx *= 0.97;
-    p.vy *= 0.97;
-    p.x += p.vx;
-    p.y += p.vy;
-
-    // Bounce
+    p.vx *= 0.97; p.vy *= 0.97;
+    p.x += p.vx; p.y += p.vy;
     if (p.x < 0 || p.x > W) p.vx *= -1;
     if (p.y < 0 || p.y > H) p.vy *= -1;
     p.x = Math.max(0, Math.min(W, p.x));
     p.y = Math.max(0, Math.min(H, p.y));
   }
 
-  // Draw connections
+  // Particle connections
   for (let i = 0; i < particles.length; i++) {
-    for (let j = i + 1; j < particles.length; j++) {
+    for (let j = i+1; j < particles.length; j++) {
       const a = particles[i], b = particles[j];
-      const dx = a.x - b.x, dy = a.y - b.y;
-      const d = Math.sqrt(dx*dx + dy*dy);
+      const d = Math.hypot(a.x-b.x, a.y-b.y);
       if (d < MAX_DIST) {
-        const alpha = (1 - d / MAX_DIST) * 0.7;
+        const alpha = (1 - d/MAX_DIST) * 0.5;
         ctx.beginPath();
         ctx.moveTo(a.x, a.y);
         ctx.lineTo(b.x, b.y);
-        ctx.strokeStyle = `hsla(${(a.hue + b.hue) / 2}, 90%, 75%, ${alpha})`;
+        ctx.strokeStyle = `hsla(${(a.hue+b.hue)/2}, 90%, 75%, ${alpha})`;
         ctx.lineWidth = alpha * 1.5;
         ctx.stroke();
       }
     }
   }
 
-  // Draw dots
+  // Particle dots
   for (const p of particles) {
     ctx.beginPath();
-    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
     ctx.fillStyle = `hsla(${p.hue}, 100%, 85%, 0.9)`;
     ctx.shadowColor = `hsla(${p.hue}, 100%, 70%, 0.8)`;
     ctx.shadowBlur = 8;
     ctx.fill();
     ctx.shadowBlur = 0;
   }
+
+  // ── Hand finger connections ──────────────────────────────────
+  drawFingerLinks();
+}
+
+function drawFingerLinks() {
+  const { left, right } = handData;
+  if (!left && !right) return;
+
+  const t = performance.now() / 1000;
+
+  // Get fingertip positions for each hand
+  const leftTips  = left  ? FINGERTIPS.map(i => lmToCanvas(left[i]))  : null;
+  const rightTips = right ? FINGERTIPS.map(i => lmToCanvas(right[i])) : null;
+
+  // Draw connections between left and right fingertips
+  if (leftTips && rightTips) {
+    for (let li = 0; li < leftTips.length; li++) {
+      for (let ri = 0; ri < rightTips.length; ri++) {
+        const a = leftTips[li], b = rightTips[ri];
+        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+        const maxLink = W * 0.8; // only link if reasonably close
+        if (dist > maxLink) continue;
+
+        const alpha = Math.max(0, 1 - dist / maxLink);
+        // Animate hue slowly
+        const hue = ((li * 30 + ri * 20 + t * 40) % 360);
+
+        // Glow line
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.strokeStyle = `hsla(${hue}, 100%, 75%, ${alpha * 0.9})`;
+        ctx.lineWidth = 2.5 * alpha;
+        ctx.shadowColor = `hsla(${hue}, 100%, 70%, ${alpha})`;
+        ctx.shadowBlur = 18;
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+
+  // Draw fingertip dots for each detected hand
+  for (const [tips, baseHue] of [[leftTips, 45], [rightTips, 200]]) {
+    if (!tips) continue;
+    for (const tip of tips) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(tip.x, tip.y, 7, 0, Math.PI * 2);
+      ctx.fillStyle = `hsla(${baseHue}, 100%, 85%, 0.95)`;
+      ctx.shadowColor = `hsla(${baseHue}, 100%, 70%, 1)`;
+      ctx.shadowBlur = 20;
+      ctx.fill();
+      ctx.restore();
+    }
+  }
 }
 
 function drawEdgeGlow() {
-  // Simple luminance edge detection via composite
   ctx.save();
   ctx.globalCompositeOperation = 'difference';
   ctx.filter = 'blur(2px)';
-  if (facingMode === 'user') {
-    ctx.translate(W, 0);
-    ctx.scale(-1, 1);
-  }
+  if (facingMode === 'user') { ctx.translate(W, 0); ctx.scale(-1, 1); }
   ctx.drawImage(video, 0, 0, W, H);
   ctx.restore();
   ctx.filter = 'none';
-
-  // Golden tint overlay
   ctx.globalCompositeOperation = 'screen';
   ctx.fillStyle = 'rgba(255,180,30,0.15)';
   ctx.fillRect(0, 0, W, H);
@@ -297,35 +385,33 @@ function drawEdgeGlow() {
 function drawMotionBurst(motionZones) {
   ctx.fillStyle = 'rgba(0,0,0,0.25)';
   ctx.fillRect(0, 0, W, H);
-
   for (const z of motionZones) {
     const r = z.intensity * 80 + 20;
     const grad = ctx.createRadialGradient(z.x, z.y, 0, z.x, z.y, r);
-    grad.addColorStop(0, `rgba(255,200,60,${z.intensity * 0.6})`);
-    grad.addColorStop(0.5, `rgba(255,80,200,${z.intensity * 0.3})`);
+    grad.addColorStop(0, `rgba(255,200,60,${z.intensity*0.6})`);
+    grad.addColorStop(0.5, `rgba(255,80,200,${z.intensity*0.3})`);
     grad.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.beginPath();
-    ctx.arc(z.x, z.y, r, 0, Math.PI * 2);
+    ctx.arc(z.x, z.y, r, 0, Math.PI*2);
     ctx.fillStyle = grad;
     ctx.fill();
   }
-
-  // Still draw particles lightly
   for (const p of particles) {
     p.x += p.vx; p.y += p.vy;
     if (p.x < 0 || p.x > W) p.vx *= -1;
     if (p.y < 0 || p.y > H) p.vy *= -1;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, p.r * 0.7, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, p.r*0.7, 0, Math.PI*2);
     ctx.fillStyle = `hsla(${p.hue}, 100%, 85%, 0.3)`;
     ctx.fill();
   }
 }
 
-// Events
-document.getElementById('start-btn').addEventListener('click', () => {
+// ── Events ───────────────────────────────────────────────────────
+document.getElementById('start-btn').addEventListener('click', async () => {
   document.getElementById('start-screen').style.display = 'none';
-  startCamera();
+  await startCamera();
+  initHands(); // load model after camera is up
 });
 
 document.getElementById('flip-btn').addEventListener('click', () => {
